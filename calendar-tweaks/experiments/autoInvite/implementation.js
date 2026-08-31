@@ -69,8 +69,8 @@ var { NetUtil } = ChromeUtils.importESModule(
 );
 
 const LOG = "[calendar-tweaks/auto-invite]";
-// Flip to false to quiet the step-by-step diagnostics once things work.
-const DEBUG = true;
+// Flip to true to re-enable the step-by-step diagnostics for troubleshooting.
+const DEBUG = false;
 function dbg(...args) {
   if (DEBUG) {
     console.log(LOG, ...args);
