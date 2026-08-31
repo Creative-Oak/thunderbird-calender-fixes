@@ -1,4 +1,4 @@
-# Thunderbird Calendar Fixes
+# Calendar Tweaks
 
 A minimal Thunderbird add-on bundling two calendar quality-of-life fixes:
 
@@ -177,7 +177,7 @@ already in your folders before installing are not retroactively scanned.
 ## Project layout
 
 ```
-thunderbird-drag-event-editor/
+calendar-tweaks/
 ├── manifest.json                       # MV2 MailExtension + experiment_apis
 ├── background.js                       # enables both experiments
 ├── experiments/
@@ -223,7 +223,7 @@ Notes:
 - A temporary add-on is removed when Thunderbird restarts — reload it the same
   way after a restart during development.
 - To see logs, open **Tools ▸ Developer Tools ▸ Error Console**
-  (`Ctrl/Cmd+Shift+J`) and look for `[drag-event-editor]` messages.
+  (`Ctrl/Cmd+Shift+J`) and look for `[calendar-tweaks]` messages.
 - After editing `implementation.js`, click **Reload** on the add-on in the
   Debug Add-ons page.
 
@@ -235,13 +235,13 @@ An XPI is just a ZIP of the add-on's contents with the `manifest.json` at the
 **root** of the archive. From inside this folder:
 
 ```bash
-cd thunderbird-drag-event-editor
-zip -r -FS ../drag-event-editor.xpi \
+cd calendar-tweaks
+zip -r -FS ../calendar-tweaks.xpi \
   manifest.json background.js experiments \
   -x '*.DS_Store'
 ```
 
-That produces `drag-event-editor.xpi` one level up.
+That produces `calendar-tweaks.xpi` one level up.
 
 Because this add-on contains an Experiment, Thunderbird will **not** run it from
 an unsigned XPI installed normally. Your options:

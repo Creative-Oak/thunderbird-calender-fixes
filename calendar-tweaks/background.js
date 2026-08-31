@@ -9,15 +9,15 @@
 (async () => {
   try {
     await browser.dragEvent.enable();
-    console.log("[calendar-fixes] drag → full event editor enabled");
+    console.log("[calendar-tweaks] drag → full event editor enabled");
   } catch (error) {
-    console.error("[calendar-fixes] dragEvent failed to enable:", error);
+    console.error("[calendar-tweaks] dragEvent failed to enable:", error);
   }
 
   try {
     await browser.autoInvite.enable();
-    console.log("[calendar-fixes] auto-add emailed invitations enabled");
+    console.log("[calendar-tweaks] auto-add emailed invitations enabled");
   } catch (error) {
-    console.error("[calendar-fixes] autoInvite failed to enable:", error);
+    console.error("[calendar-tweaks] autoInvite failed to enable:", error);
   }
 })();

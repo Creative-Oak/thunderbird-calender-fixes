@@ -133,7 +133,7 @@ function patchController(window) {
           installHighlightCleanup(window, highlightedView);
         }
       } catch (error) {
-        console.error("[drag-event-editor] highlight setup failed:", error);
+        console.error("[calendar-tweaks] highlight setup failed:", error);
       }
 
       // Open the normal full editor pre-filled with the dragged start AND end.
@@ -205,7 +205,7 @@ function patchDragHighlight(window) {
         };
       }
     } catch (error) {
-      console.error("[drag-event-editor] snapshot failed:", error);
+      console.error("[calendar-tweaks] snapshot failed:", error);
     }
 
     // Let Thunderbird do its normal cleanup (removes listeners, clears boxes,
@@ -304,7 +304,7 @@ function installHighlightCleanup(window, view) {
     try {
       clearHighlight(view);
     } catch (error) {
-      console.error("[drag-event-editor] clearHighlight failed:", error);
+      console.error("[calendar-tweaks] clearHighlight failed:", error);
     }
   };
 
@@ -334,7 +334,7 @@ function installHighlightCleanup(window, view) {
       window.setTimeout(stopWatching, 10 * 60 * 1000);
     }
   } catch (error) {
-    console.error("[drag-event-editor] dialog-close watcher failed:", error);
+    console.error("[calendar-tweaks] dialog-close watcher failed:", error);
   }
 
   // (2) Fallback: any further interaction with the main window ends the hint
@@ -357,7 +357,7 @@ function patchWindow(window) {
   try {
     patchDragHighlight(window);
   } catch (error) {
-    console.error("[drag-event-editor] highlight patch failed:", error);
+    console.error("[calendar-tweaks] highlight patch failed:", error);
   }
   patchedWindows.add(window);
 }
@@ -367,7 +367,7 @@ function unpatchWindow(window) {
   try {
     unpatchDragHighlight(window);
   } catch (error) {
-    console.error("[drag-event-editor] highlight unpatch failed:", error);
+    console.error("[calendar-tweaks] highlight unpatch failed:", error);
   }
   patchedWindows.delete(window);
 }

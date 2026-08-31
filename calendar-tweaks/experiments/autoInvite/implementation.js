@@ -58,7 +58,7 @@ var { cal } = ChromeUtils.importESModule(
   "resource:///modules/calendar/calUtils.sys.mjs"
 );
 
-const LOG = "[calendar-fixes/auto-invite]";
+const LOG = "[calendar-tweaks/auto-invite]";
 const MAIN_WINDOW_URL = "chrome://messenger/content/messenger.xhtml";
 const CSS_WINDOW_LISTENER_ID = "autoInvite-cssListener";
 const STYLE_ELEMENT_ID = "autoInvite-invitation-style";
