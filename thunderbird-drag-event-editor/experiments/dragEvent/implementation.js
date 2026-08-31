@@ -125,8 +125,15 @@ function patchController(window) {
       let highlightedView = null;
       try {
         highlightedView = redrawPendingHighlight(window);
+        // Arrange to clear the highlight once the editor closes. This MUST be
+        // set up *before* opening the dialog: the editor window opens
+        // synchronously inside createEventWithDialog(), so a watcher registered
+        // afterwards would miss it.
+        if (highlightedView) {
+          installHighlightCleanup(window, highlightedView);
+        }
       } catch (error) {
-        console.error("[drag-event-editor] highlight redraw failed:", error);
+        console.error("[drag-event-editor] highlight setup failed:", error);
       }
 
       // Open the normal full editor pre-filled with the dragged start AND end.
@@ -143,15 +150,6 @@ function patchController(window) {
         null, // template event
         forceAllday
       );
-
-      // Arrange to clear the highlight once the dialog goes away.
-      if (highlightedView) {
-        try {
-          installHighlightCleanup(window, highlightedView);
-        } catch (error) {
-          console.error("[drag-event-editor] highlight cleanup setup failed:", error);
-        }
-      }
       return undefined;
     }
 
@@ -280,8 +278,25 @@ function clearHighlight(view) {
  *      and any missed dialog-close).
  */
 function installHighlightCleanup(window, view) {
+  // Use the chrome window's own Services (guaranteed present) rather than
+  // relying on the experiment sandbox global.
+  const services = window.Services;
   let cleared = false;
+  let observer = null;
+
+  const stopWatching = () => {
+    if (observer && services) {
+      try {
+        services.ww.unregisterNotification(observer);
+      } catch (error) {
+        /* already unregistered */
+      }
+      observer = null;
+    }
+  };
+
   const clearOnce = () => {
+    stopWatching();
     if (cleared) {
       return;
     }
@@ -293,46 +308,37 @@ function installHighlightCleanup(window, view) {
     }
   };
 
-  // (1) Watch for the editor window opening, then clear on its unload.
+  // (1) Clear as soon as the editor window closes. domwindowclosed fires with
+  // the closing window as the subject, whose URL still identifies the editor.
+  // (Registered before the dialog is opened by the caller.)
   try {
-    const observer = {
-      observe(subject, topic) {
-        if (topic != "domwindowopened") {
-          return;
-        }
-        const dialogWindow = subject;
-        dialogWindow.addEventListener(
-          "load",
-          () => {
-            const href = dialogWindow.location?.href || "";
-            if (EVENT_DIALOG_URLS.some(url => href.startsWith(url))) {
-              try {
-                Services.ww.unregisterNotification(observer);
-              } catch (error) {
-                /* already unregistered */
-              }
-              dialogWindow.addEventListener("unload", clearOnce, { once: true });
-            }
-          },
-          { once: true }
-        );
-      },
-    };
-    Services.ww.registerNotification(observer);
-    // Safety: stop waiting for a new window after a few seconds (e.g. in-tab
-    // editing, where no separate window ever opens).
-    window.setTimeout(() => {
-      try {
-        Services.ww.unregisterNotification(observer);
-      } catch (error) {
-        /* already unregistered */
-      }
-    }, 5000);
+    if (services?.ww) {
+      observer = {
+        observe(subject, topic) {
+          if (topic != "domwindowclosed") {
+            return;
+          }
+          let href = "";
+          try {
+            href = subject.location?.href || subject.document?.documentURI || "";
+          } catch (error) {
+            /* window already torn down */
+          }
+          if (EVENT_DIALOG_URLS.some(url => href.includes(url))) {
+            clearOnce();
+          }
+        },
+      };
+      services.ww.registerNotification(observer);
+      // Safety: never watch forever.
+      window.setTimeout(stopWatching, 10 * 60 * 1000);
+    }
   } catch (error) {
     console.error("[drag-event-editor] dialog-close watcher failed:", error);
   }
 
-  // (2) Fallback: any further interaction with the main window ends the hint.
+  // (2) Fallback: any further interaction with the main window ends the hint
+  // (covers the "edit in a tab" pref, where no separate window closes).
   try {
     window.addEventListener("mousedown", clearOnce, { capture: true, once: true });
   } catch (error) {
