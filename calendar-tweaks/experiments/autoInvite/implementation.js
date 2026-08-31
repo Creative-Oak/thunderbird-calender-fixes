@@ -1,5 +1,12 @@
 "use strict";
 
+// NOTE: Every experiment parent script in this add-on is loaded into the SAME
+// shared global, so top-level `const`/`let` names would collide across scripts
+// (e.g. MAIN_WINDOW_URL). We wrap the whole body in an IIFE so its declarations
+// stay local; `.call(this)` keeps `this` pointing at the shared global so the
+// `this.autoInvite = …` API registration still works.
+(function () {
+
 // =============================================================================
 // Auto-add emailed invitations to the calendar  (WebExtension Experiment)
 // =============================================================================
@@ -397,3 +404,5 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
     }
   }
 };
+
+}).call(this);

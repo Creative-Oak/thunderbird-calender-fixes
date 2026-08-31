@@ -1,5 +1,11 @@
 "use strict";
 
+// NOTE: Every experiment parent script in this add-on shares ONE global, so
+// top-level `const`/`let` names would collide across scripts. Wrap the body in
+// an IIFE to keep declarations local; `.call(this)` keeps `this` as the shared
+// global so the `this.dragEvent = …` API registration still works.
+(function () {
+
 // =============================================================================
 // Calendar Drag → Full Event Editor  (WebExtension Experiment)
 // =============================================================================
@@ -432,3 +438,5 @@ this.dragEvent = class extends ExtensionCommon.ExtensionAPI {
     }
   }
 };
+
+}).call(this);
