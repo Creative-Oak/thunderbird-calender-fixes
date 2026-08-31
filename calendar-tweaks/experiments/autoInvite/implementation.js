@@ -59,6 +59,13 @@ var { cal } = ChromeUtils.importESModule(
 );
 
 const LOG = "[calendar-tweaks/auto-invite]";
+// Flip to false to quiet the step-by-step diagnostics once things work.
+const DEBUG = true;
+function dbg(...args) {
+  if (DEBUG) {
+    console.log(LOG, ...args);
+  }
+}
 const MAIN_WINDOW_URL = "chrome://messenger/content/messenger.xhtml";
 const CSS_WINDOW_LISTENER_ID = "autoInvite-cssListener";
 const STYLE_ELEMENT_ID = "autoInvite-invitation-style";
@@ -75,7 +82,9 @@ function skippableFolder(folder) {
 // -----------------------------------------------------------------------------
 
 const folderListener = {
+  QueryInterface: ChromeUtils.generateQI(["nsIMsgFolderListener"]),
   msgsClassified(msgs /*, junkProcessed, traitProcessed */) {
+    dbg(`msgsClassified fired for ${msgs.length} message(s)`);
     for (const msgHdr of msgs) {
       try {
         handleMessage(msgHdr);
@@ -88,8 +97,10 @@ const folderListener = {
 
 function handleMessage(msgHdr) {
   if (skippableFolder(msgHdr.folder)) {
+    dbg("skipping message in folder:", msgHdr.folder?.name);
     return;
   }
+  dbg("examining message:", msgHdr.mime2DecodedSubject || msgHdr.subject);
   // Parse the MIME structure (allowDownload=true so IMAP bodies not yet cached
   // are fetched). The callback runs asynchronously.
   MsgHdrToMimeMessage(
@@ -98,11 +109,20 @@ function handleMessage(msgHdr) {
     (hdr, mimeMessage) => {
       try {
         if (!mimeMessage) {
+          dbg("no MIME message returned (not downloaded?)");
           return;
         }
         const ics = findCalendarBody(mimeMessage);
         if (ics) {
+          dbg("found inline text/calendar part");
           processInvite(ics);
+        } else if (hasCalendarAttachment(mimeMessage)) {
+          // Some senders (notably Outlook) ship the invitation only as an
+          // attachment (invite.ics) rather than an inline body. v1 parses the
+          // inline form; log so we know this is the case.
+          dbg(
+            "invitation present only as an attachment (not inline); not parsed in this version"
+          );
         }
       } catch (error) {
         console.error(LOG, "invite processing failed:", error);
@@ -142,6 +162,19 @@ function findCalendarBody(part) {
   return null;
 }
 
+/**
+ * Whether the message carries a text/calendar part in any form (including as a
+ * non-inline attachment). Used only for diagnostics.
+ */
+function hasCalendarAttachment(mimeMessage) {
+  try {
+    const all = mimeMessage.allAttachments || [];
+    return all.some(a => (a.contentType || "").toLowerCase() == "text/calendar");
+  } catch (error) {
+    return false;
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Invitation → calendar item
 // -----------------------------------------------------------------------------
@@ -150,7 +183,9 @@ function processInvite(icsText) {
   // Only auto-add true invitations. METHOD:REQUEST is "please attend"; we skip
   // REPLY/CANCEL/COUNTER/REFRESH and plain event files that carry no METHOD.
   const method = (icsText.match(/^METHOD:(.+)$/im)?.[1] || "").trim().toUpperCase();
+  dbg("calendar METHOD =", method || "(none)");
   if (method != "REQUEST") {
+    dbg("not a REQUEST invitation; ignoring");
     return;
   }
 
@@ -173,7 +208,8 @@ async function addInvitation(item) {
   // invited attendee — the latter is what makes Thunderbird treat the item as
   // an invitation and draw the dotted `invitation-status` styling. Prefer the
   // default calendar among those.
-  const candidates = cal.manager.getCalendars().filter(calendar => {
+  const allCals = cal.manager.getCalendars();
+  const candidates = allCals.filter(calendar => {
     if (calendar.readOnly || calendar.getProperty("disabled")) {
       return false;
     }
@@ -187,10 +223,15 @@ async function addInvitation(item) {
     }
   });
 
+  dbg(
+    `event "${item.title}": ${allCals.length} calendar(s) total, ` +
+      `${candidates.length} recognise you as an invited attendee`
+  );
   if (!candidates.length) {
     console.log(
       LOG,
-      "no calendar is associated with this invitation's address; skipping:",
+      "no calendar is associated with this invitation's recipient address " +
+        "(set Calendar Properties > Email); skipping:",
       item.title
     );
     return;
@@ -202,6 +243,7 @@ async function addInvitation(item) {
       (a.getProperty("calendar-main-default") ? 1 : 0)
   );
   const calendar = candidates[0];
+  dbg(`adding to calendar "${calendar.name}" (uid ${item.id})`);
 
   // De-duplicate by UID: if this invitation (or a copy the user already acted
   // on) is present, do nothing.
@@ -212,6 +254,7 @@ async function addInvitation(item) {
     existing = null;
   }
   if (existing) {
+    dbg("already present in calendar; not adding again");
     return;
   }
 
@@ -292,6 +335,7 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
               Ci.nsIMsgFolderNotificationService.msgsClassified
             );
             listenerAdded = true;
+            dbg("new-mail listener registered (msgsClassified)");
           }
           // Per-window CSS for the dotted invitation border. onLoadWindow fires
           // for current and future main windows.
