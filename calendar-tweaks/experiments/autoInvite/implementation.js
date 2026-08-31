@@ -250,7 +250,7 @@ function extractCalendarFromRaw(rawSource) {
 // -----------------------------------------------------------------------------
 
 // Safety cap so a huge inbox can't spawn an unbounded number of parses.
-const BACKFILL_MAX_MESSAGES = 500;
+const BACKFILL_MAX_MESSAGES = 1000;
 
 /**
  * Scan the Inbox folder(s) of every account for invitation emails and load any
@@ -258,10 +258,13 @@ const BACKFILL_MAX_MESSAGES = 500;
  * calendar's Synchronize/reload button. Idempotent: events already present are
  * skipped by UID.
  *
- * To keep it fast we only look at messages flagged as having an attachment
- * (invitations carry the .ics), capped at BACKFILL_MAX_MESSAGES.
+ * We scan the newest BACKFILL_MAX_MESSAGES messages per run, sequentially. We do
+ * NOT pre-filter by the "has attachment" flag: Outlook/Exchange invitations
+ * embed the calendar (and their images) as inline `multipart/related` parts, so
+ * Thunderbird never sets that flag on them — filtering by it would skip exactly
+ * the invitations we want.
  */
-function backfillInvites() {
+async function backfillInvites() {
   let scanned = 0;
   let inboxes = 0;
   try {
@@ -273,10 +276,10 @@ function backfillInvites() {
       const inboxFolders = root.getFoldersWithFlags(Ci.nsMsgFolderFlags.Inbox);
       for (const folder of inboxFolders) {
         inboxes++;
-        for (const msgHdr of folder.messages) {
-          if (!(msgHdr.flags & Ci.nsMsgMessageFlags.Attachment)) {
-            continue;
-          }
+        // Newest first (message keys are roughly chronological), so the cap
+        // keeps the most recent — and most likely still-relevant — messages.
+        const hdrs = [...folder.messages];
+        for (let i = hdrs.length - 1; i >= 0; i--) {
           if (scanned >= BACKFILL_MAX_MESSAGES) {
             console.log(
               LOG,
@@ -286,14 +289,15 @@ function backfillInvites() {
             return;
           }
           scanned++;
-          parseMessageForInvite(msgHdr);
+          // Sequential to avoid firing hundreds of concurrent message streams.
+          await parseMessageForInvite(hdrs[i]);
         }
       }
     }
     console.log(
       LOG,
-      `backfill: scanned ${scanned} attachment-bearing message(s) across ` +
-        `${inboxes} inbox folder(s); any new invitations are being added.`
+      `backfill: scanned ${scanned} message(s) across ${inboxes} inbox ` +
+        "folder(s); any new invitations have been added."
     );
   } catch (error) {
     console.error(LOG, "backfill scan failed:", error);
