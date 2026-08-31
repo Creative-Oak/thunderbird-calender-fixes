@@ -131,13 +131,15 @@ item in place (no duplicate).
 - **Detect new mail.** Listens on `MailServices.mfn` with the `msgsClassified`
   flag (`nsIMsgFolderNotificationService`), which fires once per newly-arrived,
   classified message.
-- **Extract the invite.** A message's `text/calendar` part is only turned into a
-  `calIItipItem` while the message is *displayed* (the MIME converter sets
-  `channel.imipItem`). On arrival there is no such shortcut, so we parse the MIME
-  ourselves with `MsgHdrToMimeMessage`
-  (`resource:///modules/gloda/MimeMessage.sys.mjs`) and read the inline
-  `text/calendar` body. Only `METHOD:REQUEST` is auto-added — replies,
-  cancellations and plain `.ics` files (no method) are ignored.
+- **Extract the invite.** We stream the message's **raw** RFC822 source
+  (`nsIMsgMessageService.streamMessage` with `aConvertData=false`) and parse it
+  with `MimeParser` (`resource:///modules/mimeParser.sys.mjs`). We deliberately
+  avoid gloda's `MsgHdrToMimeMessage`/libmime: Thunderbird registers a MIME
+  converter for `text/calendar`, so libmime-based parsing can transform or hide
+  the invitation part (Outlook/Exchange invites especially). Raw parsing handles
+  both **inline** `text/calendar` parts and **`.ics` attachments** uniformly.
+  `METHOD:REQUEST` is added, `METHOD:CANCEL` removes the event, and other
+  methods are ignored.
 - **Recognise you.** `cal.itip.getInvitedAttendee(item, calendar)` returns the
   attendee matching a calendar's own email identity — the same check Thunderbird
   uses to treat something as an "invitation" and apply the dotted
@@ -177,8 +179,8 @@ arrived while it was disabled), pressing the calendar's **Synchronize / reload**
 button also **backfills**: it scans the Inbox of every account for
 attachment-bearing messages and loads any invitations not already in the
 calendar (capped at 500 messages, idempotent — existing events are skipped by
-UID). The backfill uses the same inline-`text/calendar` parser, so
-attachment-only invitations are logged but not yet imported.
+UID). It uses the same raw parser, so both inline and `.ics`-attachment
+invitations are imported.
 
 ---
 

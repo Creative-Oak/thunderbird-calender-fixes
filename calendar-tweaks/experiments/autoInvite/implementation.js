@@ -24,14 +24,15 @@
 // * New mail: nsIMsgFolderNotificationService ("mfn"). We listen with the
 //   `msgsClassified` flag, which fires once per newly-arrived, classified
 //   message (mailnews/base/public/nsIMsgFolderListener.idl).
-// * Extract the invite: a message's `text/calendar` part is only turned into a
-//   calIItipItem by the MIME converter while the message is *displayed*
-//   (CalMimeConverter sets channel.imipItem). On arrival there is no such
-//   shortcut, so we parse the MIME ourselves with MsgHdrToMimeMessage
-//   (resource:///modules/gloda/MimeMessage.sys.mjs) and read the inline
-//   text/calendar body.
-// * Only METHOD:REQUEST is auto-added (a real invitation). REPLY/CANCEL/COUNTER
-//   and plain .ics attachments (no METHOD) are ignored.
+// * Extract the invite: we stream the message's RAW rfc822 source
+//   (nsIMsgMessageService.streamMessage with aConvertData=false) and parse it
+//   with MimeParser (resource:///modules/mimeParser.sys.mjs). We deliberately
+//   avoid gloda's MsgHdrToMimeMessage / libmime: Thunderbird registers a MIME
+//   converter for text/calendar, so libmime-based parsing can transform or hide
+//   the invitation part (Outlook/Exchange invites especially). Raw parsing sees
+//   both inline text/calendar parts and .ics attachments uniformly.
+// * Only METHOD:REQUEST is auto-added; METHOD:CANCEL removes the event; other
+//   methods (REPLY/COUNTER/REFRESH) and non-invitation .ics files are ignored.
 // * Recognise the user: cal.itip.getInvitedAttendee(item, calendar) returns the
 //   attendee that matches that calendar's own email identity — the exact check
 //   Thunderbird uses to decide something is an "invitation" and to apply the
@@ -58,19 +59,16 @@ var { ExtensionSupport } = ChromeUtils.importESModule(
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
-var { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/MimeMessage.sys.mjs"
+var { MimeParser } = ChromeUtils.importESModule(
+  "resource:///modules/mimeParser.sys.mjs"
 );
 var { cal } = ChromeUtils.importESModule(
   "resource:///modules/calendar/calUtils.sys.mjs"
 );
-var { NetUtil } = ChromeUtils.importESModule(
-  "resource://gre/modules/NetUtil.sys.mjs"
-);
 
 const LOG = "[calendar-tweaks/auto-invite]";
-// Flip to true to re-enable the step-by-step diagnostics for troubleshooting.
-const DEBUG = false;
+// Flip to false to quiet the step-by-step diagnostics once things work.
+const DEBUG = true;
 function dbg(...args) {
   if (DEBUG) {
     console.log(LOG, ...args);
@@ -115,132 +113,143 @@ function handleMessage(msgHdr) {
     return;
   }
   dbg("examining message:", msgHdr.mime2DecodedSubject || msgHdr.subject);
-  // On arrival, allow download so IMAP bodies not yet cached are fetched.
-  parseMessageForInvite(msgHdr, true);
+  parseMessageForInvite(msgHdr);
 }
 
 /**
- * Parse one message's MIME and, if it carries an inline text/calendar
- * invitation, process it. Shared by the on-arrival listener and the manual
- * backfill scan.
+ * Read a message's RAW source and, if it carries a calendar invitation, process
+ * it. Shared by the on-arrival listener and the manual backfill scan.
+ *
+ * We parse the raw RFC822 source ourselves with MimeParser instead of gloda's
+ * MsgHdrToMimeMessage. That matters: Thunderbird registers a MIME converter for
+ * text/calendar, so libmime-based parsing (what gloda uses) can transform or
+ * hide the invitation part — Outlook/Exchange invites in particular then become
+ * invisible. Streaming the raw source (aConvertData=false) bypasses libmime
+ * entirely, and one code path then handles both inline text/calendar parts and
+ * .ics attachments.
  *
  * @param {nsIMsgDBHdr} msgHdr
- * @param {boolean} allowDownload - fetch the body if not already offline.
  */
-function parseMessageForInvite(msgHdr, allowDownload) {
-  MsgHdrToMimeMessage(
-    msgHdr,
-    null,
-    (hdr, mimeMessage) => {
-      const subject = hdr.mime2DecodedSubject || hdr.subject;
-      (async () => {
-        try {
-          if (!mimeMessage) {
-            dbg("no MIME available (message not downloaded?):", subject);
-            return;
-          }
-          // 1) Inline text/calendar part (Google-style invitations).
-          let ics = findCalendarBody(mimeMessage);
-          // 2) Otherwise a calendar attachment (invite.ics / application/ics,
-          //    as sent by Outlook and many servers).
-          if (!ics) {
-            ics = await findCalendarInAttachments(mimeMessage);
-          }
-          if (ics) {
-            processInvite(ics);
-          } else {
-            dbg("no calendar data in:", subject, "| parts:", describeParts(mimeMessage));
-          }
-        } catch (error) {
-          console.error(LOG, "invite processing failed:", error);
-        }
-      })();
-    },
-    allowDownload,
-    { partsOnDemand: false }
-  );
-}
-
-/** Does this attachment look like an iCalendar file? */
-function isCalendarAttachment(att) {
-  const ct = (att.contentType || "").toLowerCase();
-  const name = (att.name || att.url || "").toLowerCase();
-  return (
-    ct == "text/calendar" ||
-    ct == "application/ics" ||
-    ct.includes("calendar") ||
-    name.endsWith(".ics")
-  );
-}
-
-/** Fetch + decode any calendar attachment and return its ICS text, or null. */
-async function findCalendarInAttachments(mimeMessage) {
-  let attachments = [];
+async function parseMessageForInvite(msgHdr) {
+  const subject = msgHdr.mime2DecodedSubject || msgHdr.subject;
+  let rawSource;
   try {
-    attachments = (mimeMessage.allAttachments || []).filter(isCalendarAttachment);
+    rawSource = await streamRawMessage(msgHdr);
   } catch (error) {
-    return null;
+    dbg("could not read message source:", subject, "-", error?.message || error);
+    return;
   }
-  for (const att of attachments) {
-    try {
-      const text = await fetchAttachmentText(att.url);
-      if (text && text.includes("BEGIN:VCALENDAR")) {
-        dbg("found calendar attachment:", att.name || att.contentType);
-        return text;
-      }
-    } catch (error) {
-      dbg("attachment fetch failed:", att.name, "-", error?.message || error);
-    }
+  let ics;
+  try {
+    ics = extractCalendarFromRaw(rawSource);
+  } catch (error) {
+    console.error(LOG, "raw parse failed:", error);
+    return;
   }
-  return null;
+  if (ics) {
+    processInvite(ics);
+  } else {
+    dbg("no calendar part in:", subject);
+  }
 }
 
-/** Read an attachment part URL (mailbox:/imap:) and return its decoded text. */
-function fetchAttachmentText(url) {
+/** Stream a message's raw RFC822 source (no libmime conversion). */
+function streamRawMessage(msgHdr) {
   return new Promise((resolve, reject) => {
-    let channel;
+    let uri;
     try {
-      channel = NetUtil.newChannel({ uri: url, loadUsingSystemPrincipal: true });
+      uri = msgHdr.folder.getUriForMsg(msgHdr);
     } catch (error) {
       reject(error);
       return;
     }
-    NetUtil.asyncFetch(channel, (inputStream, status) => {
-      try {
-        // A failed fetch throws when we try to read the stream.
-        const text = NetUtil.readInputStreamToString(
-          inputStream,
-          inputStream.available(),
-          { charset: "UTF-8", replacement: "�" }
+    const service = MailServices.messageServiceFromURI(uri);
+    let data = "";
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI([
+        "nsIStreamListener",
+        "nsIRequestObserver",
+      ]),
+      onStartRequest() {},
+      onDataAvailable(request, inputStream, offset, count) {
+        const sis = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+          Ci.nsIScriptableInputStream
         );
-        resolve(text);
-      } catch (error) {
-        reject(error);
-      }
-    });
+        sis.init(inputStream);
+        data += sis.read(count);
+      },
+      onStopRequest(request, statusCode) {
+        if (data.length) {
+          resolve(data);
+        } else {
+          reject(new Error("empty stream (status " + statusCode + ")"));
+        }
+      },
+    };
+    try {
+      // aConvertData=false → raw source; aLocalOnly=false → may fetch if needed.
+      service.streamMessage(uri, listener, null, null, false, "", false);
+    } catch (error) {
+      reject(error);
+    }
   });
 }
 
-/** For diagnostics: a compact list of a message's attachment content types. */
-function describeParts(mimeMessage) {
-  try {
-    const atts = mimeMessage.allAttachments || [];
-    if (!atts.length) {
-      return "(no attachments)";
+/**
+ * Parse raw RFC822 source and return the ICS text of the first calendar part
+ * (inline text/calendar or an .ics/application/ics attachment), or null.
+ */
+function extractCalendarFromRaw(rawSource) {
+  const parts = new Map(); // partNum -> { type, data }
+  const emitter = {
+    startPart(partNum, headers) {
+      let type = "";
+      try {
+        if (headers.has("content-type")) {
+          type = (headers.contentType.type || "").toLowerCase();
+        }
+      } catch (error) {
+        /* part without a content-type */
+      }
+      parts.set(partNum, { type, data: "" });
+    },
+    deliverPartData(partNum, data) {
+      const part = parts.get(partNum);
+      if (part) {
+        part.data += data;
+      }
+    },
+  };
+  // strformat:"unicode" + bodyformat:"decode" → parts arrive transfer-decoded
+  // and charset-decoded to a JS string.
+  MimeParser.parseSync(rawSource, emitter, {
+    strformat: "unicode",
+    bodyformat: "decode",
+  });
+
+  const isCalType = t =>
+    t == "text/calendar" || t == "application/ics" || t.includes("calendar");
+  // Prefer a properly-typed calendar part...
+  for (const { type, data } of parts.values()) {
+    if (isCalType(type) && data && data.includes("BEGIN:VCALENDAR")) {
+      return data;
     }
-    return atts
-      .map(a => `${a.contentType || "?"}${a.name ? ` "${a.name}"` : ""}`)
-      .join(", ");
-  } catch (error) {
-    return "(unavailable)";
   }
+  // ...otherwise any part whose decoded body is actually an iCalendar object
+  // (covers generic content types like application/octet-stream for .ics).
+  for (const { data } of parts.values()) {
+    if (data && data.includes("BEGIN:VCALENDAR") && /^METHOD:/im.test(data)) {
+      return data;
+    }
+  }
+  return null;
 }
 
 // -----------------------------------------------------------------------------
 // Manual backfill: scan existing Inbox mail for invitations
 // -----------------------------------------------------------------------------
 
-// Safety cap so a huge inbox can't spawn an unbounded number of MIME parses.
+// Safety cap so a huge inbox can't spawn an unbounded number of parses.
 const BACKFILL_MAX_MESSAGES = 500;
 
 /**
@@ -250,7 +259,7 @@ const BACKFILL_MAX_MESSAGES = 500;
  * skipped by UID.
  *
  * To keep it fast we only look at messages flagged as having an attachment
- * (invitations carry the .ics as an attachment), capped at BACKFILL_MAX_MESSAGES.
+ * (invitations carry the .ics), capped at BACKFILL_MAX_MESSAGES.
  */
 function backfillInvites() {
   let scanned = 0;
@@ -265,7 +274,6 @@ function backfillInvites() {
       for (const folder of inboxFolders) {
         inboxes++;
         for (const msgHdr of folder.messages) {
-          // Cheap DB-level filter: only messages that carry an attachment.
           if (!(msgHdr.flags & Ci.nsMsgMessageFlags.Attachment)) {
             continue;
           }
@@ -278,10 +286,7 @@ function backfillInvites() {
             return;
           }
           scanned++;
-          // Allow download so we can read the MIME structure / attachment even
-          // if the body isn't cached offline yet. Bounded by the attachment
-          // filter + the message cap above.
-          parseMessageForInvite(msgHdr, true);
+          parseMessageForInvite(msgHdr);
         }
       }
     }
@@ -293,35 +298,6 @@ function backfillInvites() {
   } catch (error) {
     console.error(LOG, "backfill scan failed:", error);
   }
-}
-
-/**
- * Depth-first search for an inline text/calendar part containing a VCALENDAR.
- * (Invitations from Google/Outlook/etc. include the invite as an inline
- * text/calendar alternative part, which MsgHdrToMimeMessage exposes as a
- * MimeBody with a decoded `.body`.)
- *
- * @param {object} part - a MimeMessage/MimeContainer/MimeBody node.
- * @returns {?string} the ICS text, or null.
- */
-function findCalendarBody(part) {
-  const type = (part.contentType || "").toLowerCase();
-  if (
-    type == "text/calendar" &&
-    typeof part.body == "string" &&
-    part.body.includes("BEGIN:VCALENDAR")
-  ) {
-    return part.body;
-  }
-  if (Array.isArray(part.parts)) {
-    for (const child of part.parts) {
-      const found = findCalendarBody(child);
-      if (found) {
-        return found;
-      }
-    }
-  }
-  return null;
 }
 
 // -----------------------------------------------------------------------------
