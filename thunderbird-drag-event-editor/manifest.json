@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "Calendar Drag → Full Event Editor",
-  "version": "1.0.0",
-  "description": "When you drag a time range in the calendar to create an event, open Thunderbird's full event editor (pre-filled with the dragged start/end) instead of the inline title editor.",
+  "name": "Thunderbird Calendar Fixes",
+  "version": "1.1.0",
+  "description": "Calendar quality-of-life fixes: (1) dragging a time range opens the full event editor pre-filled with the dragged times; (2) emailed invitations are auto-added to the calendar as un-answered (dotted) items on arrival, without sending a reply.",
   "author": "Magnus H. Kaspersen",
 
   "browser_specific_settings": {
@@ -23,6 +23,14 @@
         "scopes": ["addon_parent"],
         "paths": [["dragEvent"]],
         "script": "experiments/dragEvent/implementation.js"
+      }
+    },
+    "autoInvite": {
+      "schema": "experiments/autoInvite/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["autoInvite"]],
+        "script": "experiments/autoInvite/implementation.js"
       }
     }
   }

@@ -1,0 +1,14 @@
+[
+  {
+    "namespace": "autoInvite",
+    "functions": [
+      {
+        "name": "enable",
+        "type": "function",
+        "async": true,
+        "description": "Start auto-adding emailed calendar invitations to the calendar as tentative (NEEDS-ACTION) items, without sending any reply.",
+        "parameters": []
+      }
+    ]
+  }
+]

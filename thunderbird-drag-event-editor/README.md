@@ -1,16 +1,22 @@
-# Calendar Drag → Full Event Editor
+# Thunderbird Calendar Fixes
 
-A minimal Thunderbird add-on. When you **drag across a time range** in the
-calendar (day/week views) to create a new event, Thunderbird normally creates
-the event **inline** and asks only for a title. This add-on makes that drag
-open Thunderbird's **normal full event editor** instead, pre-filled with the
-dragged start and end times — nothing is saved until you click **Save**.
+A minimal Thunderbird add-on bundling two calendar quality-of-life fixes:
 
-Everything else about creating and editing events is left exactly as-is.
+1. **Drag → full event editor.** When you drag across a time range in the
+   day/week view, open Thunderbird's normal full event editor (pre-filled with
+   the dragged start/end) instead of the inline title editor — and keep the
+   dragged slot highlighted behind the editor.
+2. **Auto-add emailed invitations.** When an email with a calendar invitation
+   arrives, add it to your calendar right away as an *un-answered* (dotted)
+   item — before you click Accept/Decline — **without sending any reply**.
+
+Each fix is a self-contained WebExtension Experiment; the two are independent.
 
 ---
 
-## How the patch works
+## Feature 1 — Drag → full event editor
+
+### How the patch works
 
 ### The interception point
 
@@ -111,16 +117,76 @@ method on shutdown.
 
 ---
 
+## Feature 2 — Auto-add emailed invitations
+
+When an email containing a calendar invitation (an iMIP `METHOD:REQUEST`)
+arrives, the add-on adds the event to your calendar immediately as an
+**un-answered invitation** — drawn with a dotted/dashed outline — *before* you
+click Accept or Decline, and **without sending any reply email**. You still
+accept/decline normally from the message's invitation bar; that updates the same
+item in place (no duplicate).
+
+### How it works (verified against comm-central tip)
+
+- **Detect new mail.** Listens on `MailServices.mfn` with the `msgsClassified`
+  flag (`nsIMsgFolderNotificationService`), which fires once per newly-arrived,
+  classified message.
+- **Extract the invite.** A message's `text/calendar` part is only turned into a
+  `calIItipItem` while the message is *displayed* (the MIME converter sets
+  `channel.imipItem`). On arrival there is no such shortcut, so we parse the MIME
+  ourselves with `MsgHdrToMimeMessage`
+  (`resource:///modules/gloda/MimeMessage.sys.mjs`) and read the inline
+  `text/calendar` body. Only `METHOD:REQUEST` is auto-added — replies,
+  cancellations and plain `.ics` files (no method) are ignored.
+- **Recognise you.** `cal.itip.getInvitedAttendee(item, calendar)` returns the
+  attendee matching a calendar's own email identity — the same check Thunderbird
+  uses to treat something as an "invitation" and apply the dotted
+  `invitation-status` styling. We add to the first calendar that recognises the
+  invite, preferring the **default** calendar.
+- **Add without replying.** We set your attendee's participation status to
+  `NEEDS-ACTION` ("not answered") and call `calendar.addItem()` **directly**.
+  Thunderbird's own Accept path wraps this in `ItipOpListener`, whose completion
+  handler emails the iTIP reply — we deliberately never use that wrapper, so
+  nothing is sent.
+- **No duplicates.** `calendar.getItem(uid)` is the same UID lookup the
+  invitation bar uses, so a later Accept finds our copy and *modifies* it rather
+  than adding a second one.
+- **Styling.** `invitation-status="NEEDS-ACTION"` already gets a dotted outline
+  from Thunderbird's CSS; because that outline is hard-coded black (invisible on
+  dark event backgrounds), the add-on injects one small theme-adaptive rule
+  (`outline: 2px dashed currentColor`) into the calendar window.
+
+### Limitation
+
+The invite is only auto-added if one of your calendars is associated with the
+email address the invitation was sent to. This is automatic for CalDAV accounts
+(Google, Fastmail, Nextcloud, …). For a **local** calendar, set it in
+**Calendar Properties ▸ Email**. If no calendar matches, the message is skipped
+(Thunderbird itself would not consider it an invitation either) — you'll see a
+`no calendar is associated…` line in the Error Console.
+
+### Scope (v1)
+
+Handles new `REQUEST` invitations. It does **not** yet auto-remove events for
+`CANCEL` messages, nor reconcile `REPLY`/`COUNTER` — those still go through
+Thunderbird's normal invitation bar. Auto-add happens on **arrival**; messages
+already in your folders before installing are not retroactively scanned.
+
+---
+
 ## Project layout
 
 ```
 thunderbird-drag-event-editor/
 ├── manifest.json                       # MV2 MailExtension + experiment_apis
-├── background.js                       # calls browser.dragEvent.enable()
+├── background.js                       # enables both experiments
 ├── experiments/
-│   └── dragEvent/
-│       ├── schema.json                 # defines the dragEvent.enable() API
-│       └── implementation.js           # the actual wrapper + window handling
+│   ├── dragEvent/
+│   │   ├── schema.json                 # dragEvent.enable()
+│   │   └── implementation.js           # drag → editor wrapper + highlight
+│   └── autoInvite/
+│       ├── schema.json                 # autoInvite.enable()
+│       └── implementation.js           # new-mail listener + invite auto-add
 └── README.md
 ```
 
@@ -193,6 +259,8 @@ an unsigned XPI installed normally. Your options:
 
 ## Testing checklist
 
+### Feature 1 — drag → editor
+
 Day or Week view unless noted:
 
 - [ ] **Drag 10:00 → 11:00:** full editor opens with those exact times.
@@ -215,6 +283,21 @@ Day or Week view unless noted:
       works.
 - [ ] **Disable / uninstall the add-on:** stock inline drag-create behavior
       returns immediately, no restart required.
+
+### Feature 2 — auto-add invitations
+
+- [ ] **Send yourself an invite** (e.g. from Google Calendar / another account)
+      to an address tied to one of your calendars. When it arrives, the event
+      appears in the calendar with a dotted/dashed outline, **without** you
+      accepting — and no reply is sent (check the organizer doesn't receive an
+      RSVP).
+- [ ] **Accept it** from the message's invitation bar: the same event turns
+      solid; there is exactly **one** copy (no duplicate).
+- [ ] **A non-invite `.ics` attachment** (no `METHOD:REQUEST`) is ignored.
+- [ ] **An invite to an address not tied to any calendar** is skipped (see the
+      `no calendar is associated…` line in the Error Console).
+- [ ] **Disable the add-on:** no further invites are auto-added; the injected
+      dashed-border style is removed.
 
 ---
 
