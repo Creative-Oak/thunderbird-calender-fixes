@@ -169,8 +169,15 @@ email address the invitation was sent to. This is automatic for CalDAV accounts
 
 Handles new `REQUEST` invitations. It does **not** yet auto-remove events for
 `CANCEL` messages, nor reconcile `REPLY`/`COUNTER` — those still go through
-Thunderbird's normal invitation bar. Auto-add happens on **arrival**; messages
-already in your folders before installing are not retroactively scanned.
+Thunderbird's normal invitation bar.
+
+Auto-add happens on **arrival**. For invitations that predate the add-on (or
+arrived while it was disabled), pressing the calendar's **Synchronize / reload**
+button also **backfills**: it scans the Inbox of every account for
+attachment-bearing messages and loads any invitations not already in the
+calendar (capped at 500 messages, idempotent — existing events are skipped by
+UID). The backfill uses the same inline-`text/calendar` parser, so
+attachment-only invitations are logged but not yet imported.
 
 ---
 

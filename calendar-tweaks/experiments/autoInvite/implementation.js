@@ -74,8 +74,12 @@ function dbg(...args) {
   }
 }
 const MAIN_WINDOW_URL = "chrome://messenger/content/messenger.xhtml";
-const CSS_WINDOW_LISTENER_ID = "autoInvite-cssListener";
+const MAIN_WINDOW_LISTENER_ID = "autoInvite-mainWindowListener";
 const STYLE_ELEMENT_ID = "autoInvite-invitation-style";
+// Stashed on the calendar command controller so we can restore doCommand.
+const DOCMD_MARKER = "_calendarTweaks_originalDoCommand";
+// The calendar's Synchronize / "reload remote calendars" command.
+const RELOAD_COMMAND = "calendar_reload_remote_calendars";
 
 // Folders whose new messages are never incoming invitations to us.
 function skippableFolder(folder) {
@@ -108,36 +112,103 @@ function handleMessage(msgHdr) {
     return;
   }
   dbg("examining message:", msgHdr.mime2DecodedSubject || msgHdr.subject);
-  // Parse the MIME structure (allowDownload=true so IMAP bodies not yet cached
-  // are fetched). The callback runs asynchronously.
+  // On arrival, allow download so IMAP bodies not yet cached are fetched.
+  parseMessageForInvite(msgHdr, true);
+}
+
+/**
+ * Parse one message's MIME and, if it carries an inline text/calendar
+ * invitation, process it. Shared by the on-arrival listener and the manual
+ * backfill scan.
+ *
+ * @param {nsIMsgDBHdr} msgHdr
+ * @param {boolean} allowDownload - fetch the body if not already offline.
+ */
+function parseMessageForInvite(msgHdr, allowDownload) {
   MsgHdrToMimeMessage(
     msgHdr,
     null,
     (hdr, mimeMessage) => {
       try {
         if (!mimeMessage) {
-          dbg("no MIME message returned (not downloaded?)");
           return;
         }
         const ics = findCalendarBody(mimeMessage);
         if (ics) {
-          dbg("found inline text/calendar part");
           processInvite(ics);
         } else if (hasCalendarAttachment(mimeMessage)) {
           // Some senders (notably Outlook) ship the invitation only as an
           // attachment (invite.ics) rather than an inline body. v1 parses the
           // inline form; log so we know this is the case.
           dbg(
-            "invitation present only as an attachment (not inline); not parsed in this version"
+            "invitation present only as an attachment (not inline); not parsed:",
+            hdr.mime2DecodedSubject || hdr.subject
           );
         }
       } catch (error) {
         console.error(LOG, "invite processing failed:", error);
       }
     },
-    true,
+    allowDownload,
     { partsOnDemand: false }
   );
+}
+
+// -----------------------------------------------------------------------------
+// Manual backfill: scan existing Inbox mail for invitations
+// -----------------------------------------------------------------------------
+
+// Safety cap so a huge inbox can't spawn an unbounded number of MIME parses.
+const BACKFILL_MAX_MESSAGES = 500;
+
+/**
+ * Scan the Inbox folder(s) of every account for invitation emails and load any
+ * that aren't already in the calendar. Triggered when the user presses the
+ * calendar's Synchronize/reload button. Idempotent: events already present are
+ * skipped by UID.
+ *
+ * To keep it fast we only look at messages flagged as having an attachment
+ * (invitations carry the .ics as an attachment), capped at BACKFILL_MAX_MESSAGES.
+ */
+function backfillInvites() {
+  let scanned = 0;
+  let inboxes = 0;
+  try {
+    for (const server of MailServices.accounts.allServers) {
+      const root = server.rootFolder;
+      if (!root) {
+        continue;
+      }
+      const inboxFolders = root.getFoldersWithFlags(Ci.nsMsgFolderFlags.Inbox);
+      for (const folder of inboxFolders) {
+        inboxes++;
+        for (const msgHdr of folder.messages) {
+          // Cheap DB-level filter: only messages that carry an attachment.
+          if (!(msgHdr.flags & Ci.nsMsgMessageFlags.Attachment)) {
+            continue;
+          }
+          if (scanned >= BACKFILL_MAX_MESSAGES) {
+            console.log(
+              LOG,
+              `backfill: reached the ${BACKFILL_MAX_MESSAGES}-message cap; ` +
+                "stopping scan (older messages not checked)"
+            );
+            return;
+          }
+          scanned++;
+          // Offline-only: don't mass-download bodies during a bulk scan.
+          parseMessageForInvite(msgHdr, false);
+        }
+      }
+    }
+    console.log(
+      LOG,
+      `backfill: scanned ${scanned} attachment-bearing message(s) across ` +
+        `${inboxes} inbox folder(s); any new invitations are being added.`
+    );
+  } catch (error) {
+    console.error(LOG, "backfill scan failed:", error);
+  }
 }
 
 /**
@@ -325,6 +396,69 @@ function removeStyle(window) {
 }
 
 // -----------------------------------------------------------------------------
+// Reload/Synchronize hook: backfill invites when the user syncs calendars
+// -----------------------------------------------------------------------------
+
+// The Synchronize toolbar button, menu item and shortcut all route through
+// `calendarController.doCommand("calendar_reload_remote_calendars")`
+// (calendar-command-controller.js). We wrap doCommand so a sync also scans the
+// Inbox for invitations that never got auto-added (arrived before install, or
+// while the add-on was disabled).
+function patchReloadHook(window) {
+  const controller = window.calendarController;
+  if (
+    !controller ||
+    typeof controller.doCommand != "function" ||
+    controller[DOCMD_MARKER]
+  ) {
+    return;
+  }
+  const original = controller.doCommand;
+  controller[DOCMD_MARKER] = original;
+  controller.doCommand = function (command) {
+    const result = original.apply(this, arguments);
+    if (command == RELOAD_COMMAND) {
+      dbg("sync pressed → scanning Inbox for un-loaded invitations");
+      try {
+        backfillInvites();
+      } catch (error) {
+        console.error(LOG, "backfill trigger failed:", error);
+      }
+    }
+    return result;
+  };
+  dbg("reload/synchronize hook installed");
+}
+
+function unpatchReloadHook(window) {
+  const controller = window.calendarController;
+  if (controller && controller[DOCMD_MARKER]) {
+    controller.doCommand = controller[DOCMD_MARKER];
+    delete controller[DOCMD_MARKER];
+  }
+}
+
+/**
+ * Set up per-window pieces (CSS + reload hook). calendarController is defined by
+ * the calendar's chrome scripts at window load, which may be slightly after
+ * onLoadWindow fires, so poll briefly for it.
+ */
+function setupWindow(window, attemptsLeft = 40) {
+  if (window.closed) {
+    return;
+  }
+  injectStyle(window);
+  if (window.calendarController && typeof window.calendarController.doCommand == "function") {
+    patchReloadHook(window);
+    return;
+  }
+  if (attemptsLeft <= 0) {
+    return;
+  }
+  window.setTimeout(() => setupWindow(window, attemptsLeft - 1), 250);
+}
+
+// -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
 
@@ -356,14 +490,16 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
               error?.stack || ""
             );
           }
-          // Per-window CSS for the dotted invitation border. onLoadWindow fires
-          // for current and future main windows.
+          // Per-window setup: dotted-invitation CSS + the Synchronize→backfill
+          // hook. onLoadWindow fires for current and future main windows.
           try {
-            ExtensionSupport.registerWindowListener(CSS_WINDOW_LISTENER_ID, {
+            ExtensionSupport.registerWindowListener(MAIN_WINDOW_LISTENER_ID, {
               chromeURLs: [MAIN_WINDOW_URL],
-              onLoadWindow: injectStyle,
+              onLoadWindow(window) {
+                setupWindow(window);
+              },
             });
-            dbg("CSS window listener registered");
+            dbg("main-window listener registered");
           } catch (error) {
             console.error(
               LOG,
@@ -391,16 +527,17 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
       listenerAdded = false;
     }
     try {
-      ExtensionSupport.unregisterWindowListener(CSS_WINDOW_LISTENER_ID);
+      ExtensionSupport.unregisterWindowListener(MAIN_WINDOW_LISTENER_ID);
     } catch (error) {
       /* not registered */
     }
     try {
       for (const window of Services.wm.getEnumerator("mail:3pane")) {
         removeStyle(window);
+        unpatchReloadHook(window);
       }
     } catch (error) {
-      console.error(LOG, "style cleanup failed:", error);
+      console.error(LOG, "window cleanup failed:", error);
     }
   }
 };
