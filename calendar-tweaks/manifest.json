@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Calendar Tweaks",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Calendar quality-of-life fixes: (1) dragging a time range opens the full event editor pre-filled with the dragged times; (2) emailed invitations are auto-added to the calendar as un-answered (dotted) items on arrival, without sending a reply.",
   "author": "Magnus H. Kaspersen",
 

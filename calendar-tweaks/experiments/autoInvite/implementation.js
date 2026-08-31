@@ -329,12 +329,13 @@ function findCalendarBody(part) {
 // -----------------------------------------------------------------------------
 
 function processInvite(icsText) {
-  // Only auto-add true invitations. METHOD:REQUEST is "please attend"; we skip
-  // REPLY/CANCEL/COUNTER/REFRESH and plain event files that carry no METHOD.
+  // METHOD:REQUEST is "please attend" → add. METHOD:CANCEL is "it's off" →
+  // remove the matching event. Everything else (REPLY/COUNTER/REFRESH, or a
+  // plain event file with no METHOD) is left to Thunderbird's invitation bar.
   const method = (icsText.match(/^METHOD:(.+)$/im)?.[1] || "").trim().toUpperCase();
   dbg("calendar METHOD =", method || "(none)");
-  if (method != "REQUEST") {
-    dbg("not a REQUEST invitation; ignoring");
+  if (method != "REQUEST" && method != "CANCEL") {
+    dbg("not a REQUEST/CANCEL invitation; ignoring");
     return;
   }
 
@@ -344,11 +345,48 @@ function processInvite(icsText) {
   parser.parseString(icsText);
 
   for (const item of parser.getItems()) {
-    if (item.isEvent && item.isEvent()) {
-      addInvitation(item).catch(error =>
-        console.error(LOG, "addInvitation failed:", error)
-      );
+    if (!(item.isEvent && item.isEvent())) {
+      continue;
     }
+    const action = method == "CANCEL" ? removeInvitation : addInvitation;
+    action(item).catch(error =>
+      console.error(LOG, `${action.name} failed:`, error)
+    );
+  }
+}
+
+/**
+ * Handle a METHOD:CANCEL: delete the matching event (by UID) from any calendar
+ * that holds it. This covers both our auto-added tentative copy and one the
+ * user has already accepted, matching Thunderbird's normal cancellation
+ * behavior. (Whole-event cancellations only; per-occurrence cancels are left to
+ * the invitation bar.)
+ */
+async function removeInvitation(item) {
+  let removed = 0;
+  for (const calendar of cal.manager.getCalendars()) {
+    if (calendar.readOnly) {
+      continue;
+    }
+    let existing = null;
+    try {
+      existing = await calendar.getItem(item.id);
+    } catch (error) {
+      existing = null;
+    }
+    if (!existing) {
+      continue;
+    }
+    try {
+      await calendar.deleteItem(existing);
+      removed++;
+      console.log(LOG, "removed cancelled invitation:", existing.title);
+    } catch (error) {
+      console.error(LOG, "deleteItem failed:", error);
+    }
+  }
+  if (!removed) {
+    dbg("cancellation for an event not in any calendar; nothing to remove:", item.title);
   }
 }
 

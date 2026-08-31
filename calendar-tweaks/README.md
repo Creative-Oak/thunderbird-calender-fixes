@@ -167,9 +167,10 @@ email address the invitation was sent to. This is automatic for CalDAV accounts
 
 ### Scope (v1)
 
-Handles new `REQUEST` invitations. It does **not** yet auto-remove events for
-`CANCEL` messages, nor reconcile `REPLY`/`COUNTER` — those still go through
-Thunderbird's normal invitation bar.
+Handles `REQUEST` invitations (adds them) and `CANCEL` messages (removes the
+matching event by UID from any calendar that holds it — whole-event
+cancellations only). `REPLY`/`COUNTER` and per-occurrence cancellations still go
+through Thunderbird's normal invitation bar.
 
 Auto-add happens on **arrival**. For invitations that predate the add-on (or
 arrived while it was disabled), pressing the calendar's **Synchronize / reload**
