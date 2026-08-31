@@ -1,0 +1,14 @@
+[
+  {
+    "namespace": "dragEvent",
+    "functions": [
+      {
+        "name": "enable",
+        "type": "function",
+        "async": true,
+        "description": "Install the calendar drag-to-create interception into all current and future main Thunderbird windows.",
+        "parameters": []
+      }
+    ]
+  }
+]

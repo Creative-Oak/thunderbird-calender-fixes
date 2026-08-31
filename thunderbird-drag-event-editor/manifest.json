@@ -1,0 +1,29 @@
+{
+  "manifest_version": 2,
+  "name": "Calendar Drag → Full Event Editor",
+  "version": "1.0.0",
+  "description": "When you drag a time range in the calendar to create an event, open Thunderbird's full event editor (pre-filled with the dragged start/end) instead of the inline title editor.",
+  "author": "Magnus H. Kaspersen",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "drag-event-editor@creativeoak.dk",
+      "strict_min_version": "128.0"
+    }
+  },
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "experiment_apis": {
+    "dragEvent": {
+      "schema": "experiments/dragEvent/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["dragEvent"]],
+        "script": "experiments/dragEvent/implementation.js"
+      }
+    }
+  }
+}
