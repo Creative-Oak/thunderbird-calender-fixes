@@ -64,6 +64,9 @@ var { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
 var { cal } = ChromeUtils.importESModule(
   "resource:///modules/calendar/calUtils.sys.mjs"
 );
+var { NetUtil } = ChromeUtils.importESModule(
+  "resource://gre/modules/NetUtil.sys.mjs"
+);
 
 const LOG = "[calendar-tweaks/auto-invite]";
 // Flip to false to quiet the step-by-step diagnostics once things work.
@@ -129,29 +132,108 @@ function parseMessageForInvite(msgHdr, allowDownload) {
     msgHdr,
     null,
     (hdr, mimeMessage) => {
-      try {
-        if (!mimeMessage) {
-          return;
+      const subject = hdr.mime2DecodedSubject || hdr.subject;
+      (async () => {
+        try {
+          if (!mimeMessage) {
+            dbg("no MIME available (message not downloaded?):", subject);
+            return;
+          }
+          // 1) Inline text/calendar part (Google-style invitations).
+          let ics = findCalendarBody(mimeMessage);
+          // 2) Otherwise a calendar attachment (invite.ics / application/ics,
+          //    as sent by Outlook and many servers).
+          if (!ics) {
+            ics = await findCalendarInAttachments(mimeMessage);
+          }
+          if (ics) {
+            processInvite(ics);
+          } else {
+            dbg("no calendar data in:", subject, "| parts:", describeParts(mimeMessage));
+          }
+        } catch (error) {
+          console.error(LOG, "invite processing failed:", error);
         }
-        const ics = findCalendarBody(mimeMessage);
-        if (ics) {
-          processInvite(ics);
-        } else if (hasCalendarAttachment(mimeMessage)) {
-          // Some senders (notably Outlook) ship the invitation only as an
-          // attachment (invite.ics) rather than an inline body. v1 parses the
-          // inline form; log so we know this is the case.
-          dbg(
-            "invitation present only as an attachment (not inline); not parsed:",
-            hdr.mime2DecodedSubject || hdr.subject
-          );
-        }
-      } catch (error) {
-        console.error(LOG, "invite processing failed:", error);
-      }
+      })();
     },
     allowDownload,
     { partsOnDemand: false }
   );
+}
+
+/** Does this attachment look like an iCalendar file? */
+function isCalendarAttachment(att) {
+  const ct = (att.contentType || "").toLowerCase();
+  const name = (att.name || att.url || "").toLowerCase();
+  return (
+    ct == "text/calendar" ||
+    ct == "application/ics" ||
+    ct.includes("calendar") ||
+    name.endsWith(".ics")
+  );
+}
+
+/** Fetch + decode any calendar attachment and return its ICS text, or null. */
+async function findCalendarInAttachments(mimeMessage) {
+  let attachments = [];
+  try {
+    attachments = (mimeMessage.allAttachments || []).filter(isCalendarAttachment);
+  } catch (error) {
+    return null;
+  }
+  for (const att of attachments) {
+    try {
+      const text = await fetchAttachmentText(att.url);
+      if (text && text.includes("BEGIN:VCALENDAR")) {
+        dbg("found calendar attachment:", att.name || att.contentType);
+        return text;
+      }
+    } catch (error) {
+      dbg("attachment fetch failed:", att.name, "-", error?.message || error);
+    }
+  }
+  return null;
+}
+
+/** Read an attachment part URL (mailbox:/imap:) and return its decoded text. */
+function fetchAttachmentText(url) {
+  return new Promise((resolve, reject) => {
+    let channel;
+    try {
+      channel = NetUtil.newChannel({ uri: url, loadUsingSystemPrincipal: true });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    NetUtil.asyncFetch(channel, (inputStream, status) => {
+      try {
+        // A failed fetch throws when we try to read the stream.
+        const text = NetUtil.readInputStreamToString(
+          inputStream,
+          inputStream.available(),
+          { charset: "UTF-8", replacement: "�" }
+        );
+        resolve(text);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+/** For diagnostics: a compact list of a message's attachment content types. */
+function describeParts(mimeMessage) {
+  try {
+    const atts = mimeMessage.allAttachments || [];
+    if (!atts.length) {
+      return "(no attachments)";
+    }
+    return atts
+      .map(a => `${a.contentType || "?"}${a.name ? ` "${a.name}"` : ""}`)
+      .join(", ");
+  } catch (error) {
+    return "(unavailable)";
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -196,8 +278,10 @@ function backfillInvites() {
             return;
           }
           scanned++;
-          // Offline-only: don't mass-download bodies during a bulk scan.
-          parseMessageForInvite(msgHdr, false);
+          // Allow download so we can read the MIME structure / attachment even
+          // if the body isn't cached offline yet. Bounded by the attachment
+          // filter + the message cap above.
+          parseMessageForInvite(msgHdr, true);
         }
       }
     }
@@ -238,19 +322,6 @@ function findCalendarBody(part) {
     }
   }
   return null;
-}
-
-/**
- * Whether the message carries a text/calendar part in any form (including as a
- * non-inline attachment). Used only for diagnostics.
- */
-function hasCalendarAttachment(mimeMessage) {
-  try {
-    const all = mimeMessage.allAttachments || [];
-    return all.some(a => (a.contentType || "").toLowerCase() == "text/calendar");
-  } catch (error) {
-    return false;
-  }
 }
 
 // -----------------------------------------------------------------------------
