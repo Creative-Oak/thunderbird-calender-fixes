@@ -328,21 +328,44 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
     return {
       autoInvite: {
         enable() {
+          // Catch and surface the real error here — the extension framework
+          // otherwise replaces it with a generic "unexpected error" message.
           // Global new-mail listener (installed once).
-          if (!listenerAdded) {
-            MailServices.mfn.addListener(
-              folderListener,
-              Ci.nsIMsgFolderNotificationService.msgsClassified
+          try {
+            if (!listenerAdded) {
+              MailServices.mfn.addListener(
+                folderListener,
+                Ci.nsIMsgFolderNotificationService.msgsClassified
+              );
+              listenerAdded = true;
+              dbg("new-mail listener registered (msgsClassified)");
+            }
+          } catch (error) {
+            console.error(
+              LOG,
+              "step 1 (mfn.addListener) failed:",
+              error?.message || error,
+              "\n",
+              error?.stack || ""
             );
-            listenerAdded = true;
-            dbg("new-mail listener registered (msgsClassified)");
           }
           // Per-window CSS for the dotted invitation border. onLoadWindow fires
           // for current and future main windows.
-          ExtensionSupport.registerWindowListener(CSS_WINDOW_LISTENER_ID, {
-            chromeURLs: [MAIN_WINDOW_URL],
-            onLoadWindow: injectStyle,
-          });
+          try {
+            ExtensionSupport.registerWindowListener(CSS_WINDOW_LISTENER_ID, {
+              chromeURLs: [MAIN_WINDOW_URL],
+              onLoadWindow: injectStyle,
+            });
+            dbg("CSS window listener registered");
+          } catch (error) {
+            console.error(
+              LOG,
+              "step 2 (registerWindowListener) failed:",
+              error?.message || error,
+              "\n",
+              error?.stack || ""
+            );
+          }
         },
       },
     };
@@ -365,8 +388,12 @@ this.autoInvite = class extends ExtensionCommon.ExtensionAPI {
     } catch (error) {
       /* not registered */
     }
-    for (const window of Services.wm.getEnumerator("mail:3pane")) {
-      removeStyle(window);
+    try {
+      for (const window of Services.wm.getEnumerator("mail:3pane")) {
+        removeStyle(window);
+      }
+    } catch (error) {
+      console.error(LOG, "style cleanup failed:", error);
     }
   }
 };
