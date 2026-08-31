@@ -43,6 +43,22 @@
 // WHY A WRAPPER (not a DOM listener): we deliberately do NOT touch drag/mouse
 // handling, snapping, timezones or cross-day logic. We intercept exactly after
 // Thunderbird has resolved the times, so all of that native behavior is reused.
+//
+// OPTIONAL: KEEP THE DRAGGED SLOT HIGHLIGHTED
+// -------------------------------------------
+// Natively, the drag draws a "shadow" box (the .fgdragbox element, toggled by a
+// `dragging` attribute) while sweeping, and clears it on mouseup *before*
+// createNewEvent runs. Because we now open a modeless dialog, the calendar
+// behind it would otherwise show no trace of the selection. So we optionally
+// re-draw that same shadow box and keep it until the dialog closes.
+//
+// Crucially we do NOT recompute any geometry: the drag's pixel/time geometry is
+// stored on the column's `mDragState` (startMin/endMin/offset/shadows) and drawn
+// by the column's own `updateColumnShadows()`. We snapshot mDragState just
+// before Thunderbird wipes it (by wrapping `clearDragging`), then briefly
+// restore it and call the native `updateColumnShadows()` to redraw. This whole
+// feature is cosmetic and fully wrapped in try/catch — if any of it fails on a
+// future Thunderbird, the core "open the editor" behavior is unaffected.
 
 var { ExtensionCommon } = ChromeUtils.importESModule(
   "resource://gre/modules/ExtensionCommon.sys.mjs"
@@ -54,51 +70,69 @@ var { ExtensionSupport } = ChromeUtils.importESModule(
 // The main 3-pane window that hosts the calendar UI and its global controller.
 const MAIN_WINDOW_URL = "chrome://messenger/content/messenger.xhtml";
 
+// The custom element tag for a single day column in the day/week views.
+const EVENT_COLUMN_TAG = "calendar-event-column";
+
+// Document URLs of the event editor window we open (windowed + in-tab iframe).
+const EVENT_DIALOG_URLS = [
+  "chrome://calendar/content/calendar-event-dialog.xhtml",
+  "chrome://calendar/content/calendar-item-iframe.xhtml",
+];
+
 // A unique id for our ExtensionSupport window listener.
 const WINDOW_LISTENER_ID = "dragEventEditor-windowListener";
 
-// Stashed on the controller object so we can (a) detect an existing patch and
-// avoid double-wrapping, and (b) restore the original on shutdown.
-const ORIGINAL_MARKER = "_dragEventEditor_originalCreateNewEvent";
+// Markers stashed on the patched objects so we can detect an existing patch and
+// restore the originals on shutdown.
+const CONTROLLER_MARKER = "_dragEventEditor_originalCreateNewEvent";
+const COLUMN_MARKER = "_dragEventEditor_originalClearDragging";
 
-// Every window whose controller we successfully patched, so we can restore them.
+// Every window we patched, so we can restore them on shutdown.
 const patchedWindows = new Set();
 
-/**
- * Wrap calendarViewController.createNewEvent on a single main window.
- *
- * @param {Window} window - a chrome://messenger/content/messenger.xhtml window.
- */
+// Transient hand-off between the drag's clearDragging (which owns the geometry)
+// and our createNewEvent (which decides whether to redraw). Set and consumed
+// within the same synchronous mouseup, so a single slot is enough.
+let pendingHighlight = null; // { window, column, view, snapshot }
+
+// -----------------------------------------------------------------------------
+// Core: redirect drag-to-create to the full editor
+// -----------------------------------------------------------------------------
+
 function patchController(window) {
   const controller = window.calendarViewController;
-
-  // Nothing to do if the calendar isn't present, the API changed, or we already
-  // patched this controller.
   if (
     !controller ||
     typeof controller.createNewEvent != "function" ||
-    controller[ORIGINAL_MARKER]
+    controller[CONTROLLER_MARKER]
   ) {
     return;
   }
 
   const original = controller.createNewEvent;
-  controller[ORIGINAL_MARKER] = original;
+  controller[CONTROLLER_MARKER] = original;
 
   controller.createNewEvent = function (calendar, startTime, endTime, forceAllday) {
     // Redirect ONLY the drag-to-create case that stock TB would create inline:
     // both endpoints present and both timed (not all-day). Anything else keeps
-    // its original behavior untouched (single click, all-day, month view, the
-    // New Event command that calls createEventWithDialog directly, etc.).
+    // its original behavior untouched.
     const bothTimed =
       startTime && endTime && !startTime.isDate && !endTime.isDate;
 
     if (bothTimed) {
+      // Cosmetic: keep the dragged slot highlighted behind the dialog. Must
+      // never interfere with actually opening the editor, hence try/catch.
+      let highlightedView = null;
+      try {
+        highlightedView = redrawPendingHighlight(window);
+      } catch (error) {
+        console.error("[drag-event-editor] highlight redraw failed:", error);
+      }
+
       // Open the normal full editor pre-filled with the dragged start AND end.
       //   - Passing `calendar` through preserves the selected/target calendar
       //     (null makes createEventWithDialog fall back to getSelectedCalendar).
-      //   - The calIDateTime objects carry their own timezone, so tz behavior
-      //     is preserved.
+      //   - The calIDateTime objects carry their own timezone.
       //   - createEventWithDialog() does NOT persist anything until the user
       //     clicks Save, satisfying "no event until confirmed".
       window.createEventWithDialog(
@@ -109,38 +143,233 @@ function patchController(window) {
         null, // template event
         forceAllday
       );
+
+      // Arrange to clear the highlight once the dialog goes away.
+      if (highlightedView) {
+        try {
+          installHighlightCleanup(window, highlightedView);
+        } catch (error) {
+          console.error("[drag-event-editor] highlight cleanup setup failed:", error);
+        }
+      }
       return undefined;
     }
 
     // Defer to stock Thunderbird for every other case.
+    pendingHighlight = null;
     return original.call(this, calendar, startTime, endTime, forceAllday);
   };
+}
 
-  patchedWindows.add(window);
+function unpatchController(window) {
+  const controller = window.calendarViewController;
+  if (controller && controller[CONTROLLER_MARKER]) {
+    controller.createNewEvent = controller[CONTROLLER_MARKER];
+    delete controller[CONTROLLER_MARKER];
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Optional: persistent drag highlight
+// -----------------------------------------------------------------------------
+
+/**
+ * Wrap the event column's clearDragging so we can capture the finished NEW-drag
+ * geometry (mDragState) *before* the original wipes it. We store it in
+ * `pendingHighlight`; createNewEvent decides whether to actually redraw.
+ */
+function patchDragHighlight(window) {
+  const columnClass = window.customElements?.get(EVENT_COLUMN_TAG);
+  if (!columnClass) {
+    return; // calendar day/week view not registered; skip cosmetics.
+  }
+  const proto = columnClass.prototype;
+  if (proto[COLUMN_MARKER]) {
+    return;
+  }
+
+  const originalClear = proto.clearDragging;
+  proto[COLUMN_MARKER] = originalClear;
+
+  proto.clearDragging = function () {
+    let snapshot = null;
+    try {
+      const ds = this.mDragState;
+      if (ds && ds.dragType == "new") {
+        // Only the fields updateColumnShadows() reads. dragOccurrence is
+        // intentionally omitted (undefined) so the todo-label branch is skipped.
+        snapshot = {
+          dragType: "new",
+          startMin: ds.startMin,
+          endMin: ds.endMin,
+          offset: ds.offset,
+          shadows: ds.shadows,
+        };
+      }
+    } catch (error) {
+      console.error("[drag-event-editor] snapshot failed:", error);
+    }
+
+    // Let Thunderbird do its normal cleanup (removes listeners, clears boxes,
+    // nulls mDragState).
+    originalClear.call(this);
+
+    pendingHighlight = snapshot
+      ? { window, column: this, view: this.calendarView, snapshot }
+      : null;
+  };
+}
+
+function unpatchDragHighlight(window) {
+  const columnClass = window.customElements?.get(EVENT_COLUMN_TAG);
+  const proto = columnClass?.prototype;
+  if (proto && proto[COLUMN_MARKER]) {
+    proto.clearDragging = proto[COLUMN_MARKER];
+    delete proto[COLUMN_MARKER];
+  }
 }
 
 /**
- * Restore the original createNewEvent on a single window.
- *
- * @param {Window} window
+ * If a NEW-drag snapshot is waiting for this window, re-draw the native shadow
+ * box by briefly restoring mDragState and calling the column's own
+ * updateColumnShadows(). Returns the view the highlight was drawn on, or null.
  */
-function unpatchController(window) {
-  const controller = window.calendarViewController;
-  if (controller && controller[ORIGINAL_MARKER]) {
-    controller.createNewEvent = controller[ORIGINAL_MARKER];
-    delete controller[ORIGINAL_MARKER];
+function redrawPendingHighlight(window) {
+  const p = pendingHighlight;
+  pendingHighlight = null;
+
+  if (!p || p.window !== window || !p.column || !p.column.isConnected) {
+    return null;
+  }
+
+  const column = p.column;
+  const previous = column.mDragState;
+  column.mDragState = p.snapshot;
+  try {
+    column.updateColumnShadows(); // native drawing, native geometry.
+  } finally {
+    column.mDragState = previous; // restore (null after clearDragging).
+  }
+  return p.view;
+}
+
+/**
+ * Remove the highlight from every column of the given view. The shadow box is
+ * only visible while the `dragging` attribute is present, so removing that hides
+ * it; we also reset the inline sizes/labels to leave the DOM clean.
+ */
+function clearHighlight(view) {
+  for (const column of view.getEventColumns()) {
+    const fg = column.fgboxes;
+    fg.dragbox.removeAttribute("dragging");
+    fg.box.removeAttribute("dragging");
+    fg.dragbox.style.removeProperty("height");
+    fg.dragbox.style.removeProperty("width");
+    fg.dragspacer.style.removeProperty("height");
+    fg.dragspacer.style.removeProperty("width");
+    fg.startlabel.value = "";
+    fg.endlabel.value = "";
+  }
+}
+
+/**
+ * Clear the highlight when the just-opened event dialog closes. Two triggers,
+ * both one-shot and idempotent:
+ *   1. the editor window's `unload` (the default, windowed editor), and
+ *   2. the next mousedown in the main window (covers the "edit in a tab" pref
+ *      and any missed dialog-close).
+ */
+function installHighlightCleanup(window, view) {
+  let cleared = false;
+  const clearOnce = () => {
+    if (cleared) {
+      return;
+    }
+    cleared = true;
+    try {
+      clearHighlight(view);
+    } catch (error) {
+      console.error("[drag-event-editor] clearHighlight failed:", error);
+    }
+  };
+
+  // (1) Watch for the editor window opening, then clear on its unload.
+  try {
+    const observer = {
+      observe(subject, topic) {
+        if (topic != "domwindowopened") {
+          return;
+        }
+        const dialogWindow = subject;
+        dialogWindow.addEventListener(
+          "load",
+          () => {
+            const href = dialogWindow.location?.href || "";
+            if (EVENT_DIALOG_URLS.some(url => href.startsWith(url))) {
+              try {
+                Services.ww.unregisterNotification(observer);
+              } catch (error) {
+                /* already unregistered */
+              }
+              dialogWindow.addEventListener("unload", clearOnce, { once: true });
+            }
+          },
+          { once: true }
+        );
+      },
+    };
+    Services.ww.registerNotification(observer);
+    // Safety: stop waiting for a new window after a few seconds (e.g. in-tab
+    // editing, where no separate window ever opens).
+    window.setTimeout(() => {
+      try {
+        Services.ww.unregisterNotification(observer);
+      } catch (error) {
+        /* already unregistered */
+      }
+    }, 5000);
+  } catch (error) {
+    console.error("[drag-event-editor] dialog-close watcher failed:", error);
+  }
+
+  // (2) Fallback: any further interaction with the main window ends the hint.
+  try {
+    window.addEventListener("mousedown", clearOnce, { capture: true, once: true });
+  } catch (error) {
+    /* non-fatal */
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Window lifecycle
+// -----------------------------------------------------------------------------
+
+function patchWindow(window) {
+  // Core behavior (required).
+  patchController(window);
+  // Cosmetic highlight (optional; must never break the core).
+  try {
+    patchDragHighlight(window);
+  } catch (error) {
+    console.error("[drag-event-editor] highlight patch failed:", error);
+  }
+  patchedWindows.add(window);
+}
+
+function unpatchWindow(window) {
+  unpatchController(window);
+  try {
+    unpatchDragHighlight(window);
+  } catch (error) {
+    console.error("[drag-event-editor] highlight unpatch failed:", error);
   }
   patchedWindows.delete(window);
 }
 
 /**
- * The calendar's chrome scripts define `calendarViewController` at window load,
- * but on a cold start that can land slightly after our onLoadWindow callback
- * fires. Poll briefly until it exists, then patch. If it never appears (e.g. a
- * window without the calendar), we simply give up quietly.
- *
- * @param {Window} window
- * @param {number} attemptsLeft
+ * The calendar's chrome scripts define `calendarViewController` (and register
+ * the column custom element) at window load, but on a cold start that can land
+ * slightly after our onLoadWindow callback fires. Poll briefly until it exists.
  */
 function patchWhenReady(window, attemptsLeft = 40) {
   if (window.closed) {
@@ -150,7 +379,7 @@ function patchWhenReady(window, attemptsLeft = 40) {
     window.calendarViewController &&
     typeof window.calendarViewController.createNewEvent == "function"
   ) {
-    patchController(window);
+    patchWindow(window);
     return;
   }
   if (attemptsLeft <= 0) {
@@ -193,7 +422,7 @@ this.dragEvent = class extends ExtensionCommon.ExtensionAPI {
     }
     ExtensionSupport.unregisterWindowListener(WINDOW_LISTENER_ID);
     for (const window of [...patchedWindows]) {
-      unpatchController(window);
+      unpatchWindow(window);
     }
   }
 };

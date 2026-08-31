@@ -60,7 +60,26 @@ drag (both timed)   →  createEventWithDialog(calendar, start, end, …)   [ful
 everything else     →  original createNewEvent(…)                       [unchanged]
 ```
 
-Why this is safe and minimal:
+### Keeping the dragged slot highlighted (cosmetic)
+
+While you drag, Thunderbird draws a "shadow" box over the swept time range (the
+`.fgdragbox` element, shown via a `dragging` attribute). Natively that box is
+cleared on mouse-up, *before* `createNewEvent` runs — so once we open a modeless
+dialog, the calendar behind it would show no trace of the selection.
+
+The add-on optionally re-draws that same shadow box and keeps it until the
+editor closes. It does **not** recompute any geometry: the drag's geometry lives
+on the column's `mDragState` (`startMin`/`endMin`/`offset`/`shadows`) and is
+drawn by the column's own `updateColumnShadows()`. We snapshot `mDragState` just
+before Thunderbird wipes it (by wrapping the column's `clearDragging`), then
+briefly restore it and call the native `updateColumnShadows()` to redraw. The
+highlight is cleared when the editor window closes (or on the next click in the
+main window).
+
+This whole feature is cosmetic and wrapped in `try/catch`: if it ever breaks on
+a future Thunderbird, the core "open the editor" behavior is unaffected.
+
+### Why this is safe and minimal
 
 - **No drag/mouse re-implementation.** We hook the point *after* Thunderbird
   has resolved the start/end times, so snapping, timezones, cross-day and
@@ -181,6 +200,8 @@ Day or Week view unless noted:
 - [ ] **Drag upward/backwards** (release above the start): start/end are in the
       correct chronological order (Thunderbird resolves this before our hook).
 - [ ] **Drag across a day boundary** (where supported): times span correctly.
+- [ ] **Dragged slot stays highlighted** behind the open editor window.
+- [ ] **Highlight clears** after the editor is saved/cancelled (or on next click).
 - [ ] **Cancel the editor:** no event remains in the calendar.
 - [ ] **Save the editor:** exactly one event is created.
 - [ ] **Double-click a time slot / single click-drag of zero length:** normal
